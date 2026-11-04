@@ -18,7 +18,7 @@
     if (window.smart_netflix_engine_loaded) return;
     window.smart_netflix_engine_loaded = true;
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
     var DAY = 24 * 60 * 60 * 1000;
     var SESSION = now();
 
@@ -44,7 +44,7 @@
     var IMPRESSION_LIMIT = 4;   // показів без реакції до «паузи»
     var COOLDOWN_DAYS = 14;     // тривалість паузи
     var ROW_SIZE = 20;          // карток у ряду
-    var ROW_TIMEOUT = 15000;    // страховка: ряд завжди повертається
+    var ROW_TIMEOUT = 10000;    // страховка: ряд завжди повертається
 
     var KEYS = {
         active: 'smart_engine_active',
@@ -485,6 +485,7 @@
             item.genres = canonGenres(genreIdsOf(item.card, meta[item.key]));
             item.decade = decadeOf(item.card);
             item.title = titleOf(item.card);
+            item.lang = item.card.original_language || (meta[item.key] && meta[item.key].l) || '';
             list.push(item);
         }
 
@@ -500,21 +501,31 @@
     // Вектор смаку профілю
     // ------------------------------------------------------------------
     function newVector() {
-        return { genres: {}, keywords: {}, decades: {}, types: { movie: 0, tv: 0 }, seeds: {}, veto: {}, kwVeto: {} };
+        return { genres: {}, keywords: {}, decades: {}, langs: {}, people: {}, colls: {}, types: { movie: 0, tv: 0 }, seeds: {}, veto: {}, kwVeto: {} };
+    }
+
+    // Мапа {id: {name, score, n}}: n — у скількох позитивних тайтлах трапилось
+    function addNamed(map, id, name, s) {
+        var e = map[id] || (map[id] = { name: name, score: 0, n: 0 });
+        e.score += s;
+        if (s > 0) e.n++;
+        if (!e.name && name) e.name = name;
     }
 
     function addFeatures(v, f, s) {
         var i;
         for (i = 0; i < f.genres.length; i++) v.genres[f.genres[i]] = (v.genres[f.genres[i]] || 0) + s;
         var m = meta[f.key];
-        if (m && m.k) {
-            for (i = 0; i < m.k.length; i++) {
-                var id = m.k[i][0];
-                var e = v.keywords[id] || (v.keywords[id] = { name: m.k[i][1], score: 0, n: 0 });
-                e.score += s;
-                if (s > 0) e.n++;
+        if (m && m.k) for (i = 0; i < m.k.length; i++) addNamed(v.keywords, m.k[i][0], m.k[i][1], s);
+        if (m && m.p) {
+            for (i = 0; i < m.p.length; i++) {
+                addNamed(v.people, m.p[i][0], m.p[i][1], s);
+                if (m.p[i][2]) v.people[m.p[i][0]].dir = 1;
             }
         }
+        if (m && m.c && s > 0) addNamed(v.colls, m.c[0], m.c[1], s);
+        var lang = f.lang || (m && m.l) || '';
+        if (lang) addNamed(v.langs, lang, lang, s);
         if (f.decade) v.decades[f.decade] = (v.decades[f.decade] || 0) + s;
         v.types[f.type] = (v.types[f.type] || 0) + s;
     }
@@ -544,7 +555,7 @@
         }
 
         each(prof.manual, function (key, m) {
-            var f = { key: key, id: m.id, type: m.type, title: m.title, genres: m.g || [], decade: m.d || '', t: m.t, w: m.w };
+            var f = { key: key, id: m.id, type: m.type, title: m.title, genres: m.g || [], decade: m.d || '', lang: m.l || '', t: m.t, w: m.w };
             var s = m.w * decay(m.t);
             addFeatures(v, f, s);
             addSeed(v, f, s);
@@ -574,15 +585,22 @@
             if (r.veto) v.veto[k] = true;
         });
 
-        keys = {};
-        each(a.keywords, function (k) { keys[k] = 1; });
-        each(b.keywords, function (k) { keys[k] = 1; });
-        each(keys, function (k) {
-            var ea = a.keywords[k], eb = b.keywords[k];
-            var r = combineVal(ea ? ea.score : 0, eb ? eb.score : 0);
-            v.keywords[k] = { name: (ea || eb).name, score: r.val, n: (ea ? ea.n : 0) + (eb ? eb.n : 0) };
-            if (r.veto) v.kwVeto[k] = true;
-        });
+        var combineNamed = function (field, vetoMap) {
+            var ks = {};
+            each(a[field], function (k) { ks[k] = 1; });
+            each(b[field], function (k) { ks[k] = 1; });
+            each(ks, function (k) {
+                var ea = a[field][k], eb = b[field][k];
+                var r = combineVal(ea ? ea.score : 0, eb ? eb.score : 0);
+                v[field][k] = { name: (ea || eb).name, score: r.val, n: (ea ? ea.n : 0) + (eb ? eb.n : 0) };
+                if ((ea && ea.dir) || (eb && eb.dir)) v[field][k].dir = 1;
+                if (r.veto && vetoMap) vetoMap[k] = true;
+            });
+        };
+        combineNamed('keywords', v.kwVeto);
+        combineNamed('people', null);
+        combineNamed('langs', null);
+        combineNamed('colls', null);
 
         keys = {};
         each(a.decades, function (k) { keys[k] = 1; });
@@ -629,8 +647,10 @@
             if (e.score <= VETO) v.kwVeto[k] = true;
         });
         each(v.decades, function (d, s) { if (s > dMax) dMax = s; });
+        var lMax = 0;
+        each(v.langs, function (l, e) { if (e.score > lMax) lMax = e.score; });
         pos.sort(function (a, b) { return v.genres[b] - v.genres[a]; });
-        v.gMax = gMax; v.kMax = kMax; v.dMax = dMax;
+        v.gMax = gMax; v.kMax = kMax; v.dMax = dMax; v.lMax = lMax;
         v.topGenres = pos;
         v.negGenres = neg;
         v.empty = gMax <= 0;
@@ -640,6 +660,15 @@
         var out = [];
         each(v.keywords, function (id, e) {
             if (e.score > 0 && e.n >= minN && !v.kwVeto[id] && !KEYWORD_STOP[String(e.name).toLowerCase()]) out.push({ id: id, name: e.name, score: e.score });
+        });
+        out.sort(function (a, b) { return b.score - a.score; });
+        return out.slice(0, limit);
+    }
+
+    function topNamed(map, limit, minN, skip) {
+        var out = [];
+        each(map, function (id, e) {
+            if (e.score > 0 && e.n >= minN && !(skip && skip[id])) out.push({ id: id, name: e.name, score: e.score, n: e.n });
         });
         out.sort(function (a, b) { return b.score - a.score; });
         return out.slice(0, limit);
@@ -815,8 +844,11 @@
     // ------------------------------------------------------------------
     var profilerRunning = false;
 
-    function parseMeta(json, type) {
-        var g = [], k = [], i;
+    var META_V = 2;
+
+    // credits — окремий об'єкт {cast, crew} (з append_to_response або з повної картки Lampa)
+    function parseMeta(json, type, credits) {
+        var g = [], k = [], p = [], i;
         var gs = (json && json.genres) || [];
         for (i = 0; i < gs.length; i++) if (gs[i] && gs[i].id) g.push(gs[i].id);
         var kw = json && json.keywords ? (json.keywords.keywords || json.keywords.results || []) : [];
@@ -825,26 +857,36 @@
             if (KEYWORD_STOP[String(kw[i].name || '').toLowerCase()]) continue;
             k.push([kw[i].id, kw[i].name]);
         }
-        return { g: g, k: k, d: decadeOf(json), t: now() };
+        var cr = credits || (json && json.credits) || {};
+        var cast = cr.cast || [], crew = cr.crew || [];
+        for (i = 0; i < cast.length && p.length < 4; i++) if (cast[i] && cast[i].id) p.push([cast[i].id, cast[i].name || '']);
+        var dirs = 0;
+        for (i = 0; i < crew.length && dirs < 1; i++) {
+            if (crew[i] && crew[i].id && crew[i].job === 'Director') { p.push([crew[i].id, crew[i].name || '', 1]); dirs++; }
+        }
+        var out = { v: META_V, g: g, k: k, p: p, d: decadeOf(json), l: (json && json.original_language) || '', t: now() };
+        var col = json && json.belongs_to_collection;
+        if (col && col.id) out.c = [col.id, col.name || ''];
+        return out;
     }
 
     function needsMeta(key) {
         var m = meta[key];
         if (!m) return true;
-        if (m.f && now() - m.t > 3 * DAY) return true;
-        return false;
+        if (m.f) return now() - m.t > 3 * DAY;
+        return m.v !== META_V;
     }
 
     function fetchMeta(type, id, cb) {
         var key = keyFor(type, id);
         if (!needsMeta(key)) { if (cb) cb(meta[key]); return; }
-        Net.get(type + '/' + id, { append_to_response: 'keywords' }, function (json) {
+        Net.get(type + '/' + id, { append_to_response: 'keywords,credits' }, function (json) {
             if (json && json.id) {
                 meta[key] = parseMeta(json, type);
             } else {
                 meta[key] = { f: 1, t: now() };
             }
-            prune(meta, 900, function (m) { return m.t || 0; });
+            prune(meta, 800, function (m) { return m.t || 0; });
             saveMeta();
             invalidateSoft();
             if (cb) cb(meta[key]);
@@ -893,9 +935,13 @@
     // ------------------------------------------------------------------
     function norm(x, max) { return max > 0 ? clamp(x / max, -1, 1) : 0; }
 
+    // Штраф за повтори: що частіше і що нещодавніше показували — то нижче
     function impressionPenalty(key) {
         var e = impressions[key];
-        return e && e.c ? e.c * 1.5 : 0;
+        if (!e) return 0;
+        var p = (e.c || 0) * 1.5;
+        if (e.s && e.s !== SESSION && e.t && now() - e.t < 2 * DAY) p += 4;
+        return p;
     }
 
     function genreMatch(c, v) {
@@ -926,7 +972,10 @@
         }
         if (extra.kwHits) km += Math.min(6, 3 * extra.kwHits);
         var dm = 2 * norm(v.decades[decadeOf(c)] || 0, v.dMax);
-        var s = (extra.overlap || 0) * 12 + (c.vote_average || 0) + gm.score + km + dm - impressionPenalty(key) + Math.random() * 1.5;
+        var lm = 0;
+        var lang = c.original_language;
+        if (lang && v.langs[lang] && v.lMax > 0) lm = 2 * norm(v.langs[lang].score, v.lMax);
+        var s = (extra.overlap || 0) * 12 + (c.vote_average || 0) + gm.score + km + dm + lm - impressionPenalty(key) + Math.random() * 3;
         if (gm.veto) s -= 25;
         if ((c.vote_count || 0) < 30) s -= 4;
         return s;
@@ -972,6 +1021,13 @@
 
     function withoutGenres(v, type, keep) {
         var neg = genresForType(v.negGenres || [], type);
+        // Новини й ток-шоу засмічують discover/tv — прибираємо, якщо людина сама їх не дивиться
+        if (type === 'tv') {
+            for (var i = 0; i < TV_ONLY_NOISE.length; i++) {
+                var g = TV_ONLY_NOISE[i];
+                if (!((v.genres && v.genres[g]) > 0) && neg.indexOf(g) < 0) neg.push(g);
+            }
+        }
         if (keep) neg = neg.filter(function (g) { return keep.indexOf(g) < 0; });
         return neg.join(',');
     }
@@ -1263,18 +1319,25 @@
     // ------------------------------------------------------------------
     // Ряд 3: «Тому що ви дивилися …»
     // ------------------------------------------------------------------
-    function pickRecentSeed(ctx) {
+    // mode 'recent' — з 15 останніх; 'top' — з найулюбленіших за весь час. Насіння не повторюється в одному показі
+    function pickSeed(ctx, mode) {
         var arr = [];
-        each(ctx.vec.seeds, function (k, e) { if (e.s > 0 && e.id) arr.push(e); });
-        arr.sort(function (a, b) { return b.t - a.t; });
+        if (!ctx.usedSeeds) ctx.usedSeeds = {};
+        each(ctx.vec.seeds, function (k, e) { if (e.s > 0 && e.id && !ctx.usedSeeds[k]) arr.push(e); });
+        if (mode === 'top') arr.sort(function (a, b) { return b.s - a.s; });
+        else arr.sort(function (a, b) { return b.t - a.t; });
         var strong = arr.filter(function (e) { return e.w >= W.progress; }).slice(0, 15);
         var src = strong.length ? strong : arr.slice(0, 15);
-        return src.length ? src[rand(0, src.length - 1)] : null;
+        if (!src.length) return null;
+        var seed = src[rand(0, src.length - 1)];
+        ctx.usedSeeds[seed.key] = 1;
+        return seed;
     }
 
-    function buildBecauseRow(n, ctx, finish) {
-        var seed = pickRecentSeed(ctx);
+    function buildBecauseRow(n, ctx, finish, mode) {
+        var seed = pickSeed(ctx, mode || 'recent');
         if (!seed) return gateClaim(ctx, n, [], function () { finish(); });
+        var prefix = mode === 'top' ? '🎬 Схоже на «' : '🎬 Тому що ви дивилися «';
 
         fetchMeta(seed.type, seed.id, function (m) {
             var type = seed.type;
@@ -1315,7 +1378,7 @@
                 var list = pool.scored().filter(function (e) { return e.key !== seedKey; });
                 gateClaim(ctx, n, list, function (picks, rest) {
                     if (!picks.length) return finish();
-                    finish(scoredRowJson(n, '🎬 Тому що ви дивилися «' + seed.title + '»', picks, rest));
+                    finish(scoredRowJson(n, prefix + seed.title + '»', picks, rest));
                 });
             });
         });
@@ -1544,61 +1607,545 @@
     }
 
     // ------------------------------------------------------------------
-    // Реєстрація рядів на головній
+    // Нові категорії, що чергуються між запусками
     // ------------------------------------------------------------------
-    var ROWS = [
-        { index: 0, name: 'smart_engine_row0', title: '🔥 Вже вийшло в якості (Закладки)', gate: false, build: function (n, ctx, f) { buildRow0(ctx, f); } },
-        { index: 1, name: 'smart_engine_row1', title: '🎯 Персональний підбір: Фільми', gate: true, build: function (n, ctx, f) { buildPersonalRow(n, 'movie', ctx, f); } },
-        { index: 2, name: 'smart_engine_row2', title: '📺 Персональний підбір: Серіали', gate: true, build: function (n, ctx, f) { buildPersonalRow(n, 'tv', ctx, f); } },
-        { index: 3, name: 'smart_engine_row3', title: '🎬 Тому що ви дивилися…', gate: true, build: buildBecauseRow },
-        { index: 4, name: 'smart_engine_row4', title: '🧩 Мікро-жанр: Фільми', gate: true, build: function (n, ctx, f) { buildMicroRow(n, 'movie', ctx, f); } },
-        { index: 5, name: 'smart_engine_row5', title: '🧩 Мікро-жанр: Серіали', gate: true, build: function (n, ctx, f) { buildMicroRow(n, 'tv', ctx, f); } },
-        { index: 6, name: 'smart_engine_row6', title: '⚡ Свіжі цифрові релізи', gate: true, build: buildFreshRow },
-        { index: 7, name: 'smart_engine_row7', title: '🎲 Нові горизонти', gate: true, build: buildExploreRow },
-        { index: 8, name: 'smart_engine_row8', title: '🗓 Очікувані прем\'єри', gate: false, build: function (n, ctx, f) { buildUpcomingRow(ctx, f); } }
-    ];
+    var LANG_UA = {
+        uk: 'українська', ru: 'російська', ko: 'корейська', ja: 'японська', zh: 'китайська', cn: 'кантонська',
+        es: 'іспанська', fr: 'французька', de: 'німецька', it: 'італійська', pt: 'португальська', pl: 'польська',
+        tr: 'турецька', hi: 'гінді', te: 'телугу', ta: 'тамільська', ml: 'малаялам', th: 'тайська', sv: 'шведська',
+        da: 'данська', no: 'норвезька', fi: 'фінська', nl: 'нідерландська', cs: 'чеська', hu: 'угорська',
+        he: 'іврит', ar: 'арабська', fa: 'перська', id: 'індонезійська', tl: 'тагальська', el: 'грецька',
+        ro: 'румунська', is: 'ісландська', ka: 'грузинська', en: 'англійська'
+    };
 
-    function makeRowCallback(row) {
-        return function (params, screen) {
-            var ctx;
-            try { ctx = freshBuildContext(); } catch (e) { log('context error', e); return; }
-            return function (call) {
-                var finish = once(function (json) {
-                    try { call(json && json.results && json.results.length ? json : undefined); } catch (e) { log('row call error', e); }
-                });
-                if (row.gate) gateStart(ctx, row.index);
-                var timer = setTimeout(function () {
-                    if (row.gate) gateClaim(ctx, row.index, [], function () { });
-                    finish();
-                }, ROW_TIMEOUT);
-                try {
-                    row.build(row.index, ctx, function (json) { clearTimeout(timer); finish(json); });
-                } catch (e) {
-                    log('row build error', row.name, e);
-                    clearTimeout(timer);
-                    if (row.gate) gateClaim(ctx, row.index, [], function () { });
-                    finish();
-                }
-            };
+    function copyObj(o) { var r = {}; each(o, function (k, v) { r[k] = v; }); return r; }
+
+    function typeSuffix(type) { return type === 'tv' ? ' · Серіали' : ' · Фільми'; }
+
+    // Фільми чи серіали — пропорційно тому, що людина дивиться
+    function pickType(v) {
+        var tTotal = Math.abs(v.types.movie || 0) + Math.abs(v.types.tv || 0);
+        var tvShare = tTotal ? Math.max(0, v.types.tv || 0) / tTotal : 0.4;
+        return Math.random() < clamp(tvShare, 0.2, 0.8) ? 'tv' : 'movie';
+    }
+
+    // Один з улюблених жанрів (зважено), уже в id потрібного типу
+    function pickGenre(v, type, topN, skip) {
+        var list = [], seen = {};
+        var top = v.topGenres || [];
+        for (var i = 0; i < top.length && list.length < (topN || 4); i++) {
+            var mapped = genresForType([top[i]], type)[0];
+            if (!mapped || seen[mapped] || (skip && skip[mapped])) continue;
+            seen[mapped] = 1;
+            list.push({ id: mapped, canon: top[i], w: v.genres[top[i]] || 0 });
+        }
+        return list.length ? weightedPick(list, function (g) { return g.w; }) : null;
+    }
+
+    function topGenresParam(v, type, n) { return genresForType((v.topGenres || []).slice(0, n || 3), type).join('|'); }
+
+    function qualityScore(type, v) {
+        return function (e) {
+            var gm = genreMatch(e.c, v);
+            return bayes(e.c) * 2 + gm.score * 0.5 - impressionPenalty(e.key) + Math.random() * 1.5;
         };
     }
+
+    // Універсальний ряд з discover/trending: кілька сторінок → скоринг → дедуплікація → ряд
+    function runListRow(n, ctx, finish, spec) {
+        var pool = new Pool(spec.type, ctx, spec.mode || 'digital');
+        var total = 1;
+        var pages = spec.pages || [rand(1, 3)];
+        var fetchPages = function (list, done) {
+            var tasks = [];
+            for (var i = 0; i < list.length; i++) {
+                (function (page) {
+                    tasks.push(function (cb) {
+                        var q = copyObj(spec.query);
+                        q.page = page;
+                        tmdbList(spec.path, q, function (res, json) {
+                            total = Math.max(total, json.total_pages || 1);
+                            pool.add(res, spec.addOpts || {});
+                            cb();
+                        }, spec.cache || 60 * 6);
+                    });
+                })(list[i]);
+            }
+            join(tasks, done);
+        };
+        var retried = false;
+        var complete = function () {
+            var list = pool.scored(spec.score);
+            // Замало після фільтрів — ще одна сторінка в той самий пул
+            if (list.length < (spec.minItems || 6) && !retried && total > 1) {
+                retried = true;
+                var extra = 1;
+                while (pages.indexOf(extra) >= 0 && extra < total) extra++;
+                if (pages.indexOf(extra) < 0) return fetchPages([extra], complete);
+            }
+            if (list.length < (spec.minItems || 6) && spec.fallback) {
+                var fb = spec.fallback();
+                if (fb) return runListRow(n, ctx, finish, fb);
+            }
+            gateClaim(ctx, n, list, function (picks) {
+                if (picks.length < 4) return finish();
+                var items = toItems(picks);
+                recordImpressions(items);
+                finish(discoverRowJson(spec.title, spec.path, spec.query, items, total));
+            });
+        };
+        fetchPages(pages, complete);
+    }
+
+    // 🏆 Топ рейтингу (TMDB, багато голосів) в одному з улюблених жанрів
+    function buildTopRated(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var g = pickGenre(v, type, 4);
+        var q = {
+            sort_by: 'vote_average.desc',
+            'vote_count.gte': type === 'tv' ? 800 : 3000,
+            without_genres: withoutGenres(v, type, g ? [g.id] : null)
+        };
+        if (g) q.with_genres = g.id;
+        if (type === 'movie') q['primary_release_date.lte'] = today(-45);
+        runListRow(n, ctx, finish, {
+            type: type, path: 'discover/' + type, query: q, pages: [rand(1, 3), rand(4, 6)], cache: 60 * 24,
+            score: qualityScore(type, v),
+            title: '🏆 Топ рейтингу' + (g ? ': ' + genreName(g.canon) : '') + typeSuffix(type)
+        });
+    }
+
+    // 💎 Високий рейтинг, але мало голосів — те, що легко пропустити
+    function buildGems(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var g = pickGenre(v, type, 5);
+        var q = {
+            sort_by: 'vote_average.desc',
+            'vote_average.gte': type === 'tv' ? 7.5 : 7.1,
+            'vote_count.gte': type === 'tv' ? 60 : 150,
+            'vote_count.lte': type === 'tv' ? 500 : 1500,
+            without_genres: withoutGenres(v, type, g ? [g.id] : null)
+        };
+        if (g) q.with_genres = g.id;
+        if (type === 'movie') q['primary_release_date.lte'] = today(-45);
+        runListRow(n, ctx, finish, {
+            type: type, path: 'discover/' + type, query: q, pages: [rand(1, 2)], cache: 60 * 24,
+            score: qualityScore(type, v),
+            title: '💎 Сховані перлини' + (g ? ': ' + genreName(g.canon) : '') + typeSuffix(type)
+        });
+    }
+
+    // ❤️ Один з улюблених жанрів, щоразу з іншим сортуванням і сторінкою
+    function buildFavGenre(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var g = pickGenre(v, type, 4);
+        if (!g) return gateClaim(ctx, n, [], function () { finish(); });
+        var sorts = type === 'tv' ? ['popularity.desc', 'vote_count.desc'] : ['popularity.desc', 'vote_count.desc', 'revenue.desc'];
+        var q = {
+            with_genres: g.id,
+            without_genres: withoutGenres(v, type, [g.id]),
+            sort_by: sorts[rand(0, sorts.length - 1)],
+            'vote_count.gte': type === 'tv' ? 100 : 300
+        };
+        if (type === 'movie') digitalQuery(q, false);
+        runListRow(n, ctx, finish, {
+            type: type, path: 'discover/' + type, query: q, pages: [rand(1, 5)], mode: type === 'movie' ? 'rec' : 'digital',
+            title: '❤️ Бо ви любите: ' + genreName(g.canon) + typeSuffix(type)
+        });
+    }
+
+    function topDecades(v) {
+        var out = [];
+        each(v.decades, function (d, s) { if (s > 0 && /^\d{4}s$/.test(d)) out.push({ d: d, s: s }); });
+        out.sort(function (a, b) { return b.s - a.s; });
+        return out.slice(0, 3);
+    }
+
+    // 📼 Хіти улюбленого десятиліття
+    function buildDecade(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var decs = topDecades(v);
+        if (!decs.length) return gateClaim(ctx, n, [], function () { finish(); });
+        var dec = weightedPick(decs, function (x) { return x.s; });
+        var y = parseInt(dec.d, 10);
+        var from = y + '-01-01', to = (y + 9) + '-12-31';
+        if (type === 'movie' && to > today(-45)) to = today(-45);
+        var q = {
+            with_genres: topGenresParam(v, type, 3),
+            without_genres: withoutGenres(v, type),
+            sort_by: 'vote_count.desc',
+            'vote_count.gte': type === 'tv' ? 80 : 200
+        };
+        q[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = from;
+        q[type === 'tv' ? 'first_air_date.lte' : 'primary_release_date.lte'] = to;
+        runListRow(n, ctx, finish, {
+            type: type, path: 'discover/' + type, query: q, pages: [rand(1, 3)], cache: 60 * 24,
+            title: '📼 Хіти ' + y + '-х під ваш смак' + typeSuffix(type)
+        });
+    }
+
+    function topLangs(v) {
+        return topNamed(v.langs, 4, 2, { en: 1 }).filter(function (l) { return l.score >= 0.1 * (v.lMax || 1); });
+    }
+
+    // 🌏 Мова оригіналу, яку людина часто дивиться (корейське, японське, українське…)
+    function buildLanguage(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var langs = topLangs(v);
+        if (!langs.length) return gateClaim(ctx, n, [], function () { finish(); });
+        var l = weightedPick(langs, function (x) { return x.score; }).id;
+        var base = {
+            with_original_language: l,
+            without_genres: withoutGenres(v, type),
+            sort_by: 'popularity.desc',
+            'vote_count.gte': type === 'tv' ? 20 : 40
+        };
+        if (type === 'movie') digitalQuery(base, false);
+        var withG = copyObj(base);
+        withG.with_genres = topGenresParam(v, type, 3);
+        var title = '🌏 Мова оригіналу: ' + (LANG_UA[l] || l) + typeSuffix(type);
+        runListRow(n, ctx, finish, {
+            type: type, path: 'discover/' + type, query: withG, pages: [rand(1, 2)], title: title,
+            fallback: function () { return { type: type, path: 'discover/' + type, query: base, pages: [rand(1, 2)], title: title }; }
+        });
+    }
+
+    function topPeople(v, ctx) {
+        return topNamed(v.people, 8, 2, ctx.usedPeople);
+    }
+
+    // 🎭 Актор чи режисер, що трапляється у ваших улюблених тайтлах
+    function buildPeople(n, ctx, finish) {
+        var v = ctx.vec;
+        if (!ctx.usedPeople) ctx.usedPeople = {};
+        var people = topPeople(v, ctx);
+        if (!people.length) return gateClaim(ctx, n, [], function () { finish(); });
+        var order = [];
+        var left = people.slice(0);
+        while (left.length && order.length < 3) {
+            var p = weightedPick(left, function (x) { return x.score; });
+            order.push(p);
+            left.splice(left.indexOf(p), 1);
+        }
+        var specFor = function (i) {
+            var person = order[i];
+            ctx.usedPeople[person.id] = 1;
+            var isDir = v.people[person.id] && v.people[person.id].dir;
+            return {
+                type: 'movie', path: 'discover/movie',
+                query: { with_people: person.id, sort_by: 'popularity.desc', 'vote_count.gte': 30, without_genres: withoutGenres(v, 'movie') },
+                pages: [1], mode: 'rec', minItems: 5, cache: 60 * 24,
+                title: (isDir ? '🎬 Режисер: ' : '🎭 Більше з: ') + person.name,
+                fallback: i + 1 < order.length ? function () { return specFor(i + 1); } : null
+            };
+        };
+        runListRow(n, ctx, finish, specFor(0));
+    }
+
+    // 🎞 Інші частини франшиз, які вам сподобались
+    function buildFranchise(n, ctx, finish) {
+        var v = ctx.vec;
+        var colls = topNamed(v.colls, 4, 1);
+        if (!colls.length) return gateClaim(ctx, n, [], function () { finish(); });
+        var pool = new Pool('movie', ctx, 'rec');
+        var tasks = [];
+        for (var i = 0; i < colls.length; i++) {
+            (function (col, rank) {
+                tasks.push(function (cb) {
+                    Net.get('collection/' + col.id, {}, function (json) {
+                        var parts = (json && json.parts) || [];
+                        pool.add(parts, { bonus: (colls.length - rank) * 3 });
+                        cb();
+                    }, function () { cb(); }, 60 * 24 * 3);
+                });
+            })(colls[i], i);
+        }
+        join(tasks, function () {
+            var list = pool.scored(function (e) { return (e.c.release_date ? -parseInt(e.c.release_date.slice(0, 4), 10) / 1000 : 0) + bayes(e.c) * 0.3; });
+            gateClaim(ctx, n, list, function (picks, rest) {
+                if (picks.length < 2) return finish();
+                finish(scoredRowJson(n, '🎞 Продовження ваших франшиз', picks, rest));
+            });
+        });
+    }
+
+    // 📈 Тренди тижня, перевпорядковані під ваш смак
+    function buildTrending(n, ctx, finish) {
+        var v = ctx.vec, type = pickType(v);
+        var specFor = function (t) {
+            return {
+                type: t, path: 'trending/' + t + '/week', query: {}, pages: [1, 2, 3], mode: t === 'movie' ? 'rec' : 'digital', cache: 60 * 6,
+                score: function (e) { return scoreCandidate(e.c, t, v, e) + Math.log(1 + (e.c.popularity || 0)) * 0.5; },
+                title: '📈 Зараз у тренді — під ваш смак' + typeSuffix(t),
+                fallback: t === type ? function () { return specFor(t === 'tv' ? 'movie' : 'tv'); } : null
+            };
+        };
+        runListRow(n, ctx, finish, specFor(type));
+    }
+
+    // ⏱ Фільми до 100 хвилин в улюблених жанрах
+    function buildShort(n, ctx, finish) {
+        var v = ctx.vec;
+        var q = {
+            with_genres: topGenresParam(v, 'movie', 3),
+            without_genres: withoutGenres(v, 'movie'),
+            'with_runtime.gte': 70,
+            'with_runtime.lte': 100,
+            sort_by: 'popularity.desc',
+            'vote_count.gte': 300
+        };
+        digitalQuery(q, false);
+        runListRow(n, ctx, finish, {
+            type: 'movie', path: 'discover/movie', query: q, pages: [rand(1, 4)], mode: 'rec',
+            title: '⏱ На один вечір: до 100 хвилин'
+        });
+    }
+
+    // 🆕 Серіали, що стартували за останні ~7 місяців
+    function buildNewSeries(n, ctx, finish) {
+        var v = ctx.vec;
+        var q = {
+            'first_air_date.gte': today(-200),
+            'first_air_date.lte': today(),
+            with_genres: topGenresParam(v, 'tv', 3),
+            without_genres: withoutGenres(v, 'tv'),
+            sort_by: 'popularity.desc',
+            'vote_count.gte': 15
+        };
+        runListRow(n, ctx, finish, {
+            type: 'tv', path: 'discover/tv', query: q, pages: [1, 2], minItems: 6,
+            title: '🆕 Нові серіали під ваш смак',
+            fallback: function () { var qq = copyObj(q); delete qq.with_genres; return { type: 'tv', path: 'discover/tv', query: qq, pages: [1], title: '🆕 Нові серіали' }; }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // План головної: постійні ряди + ряди, що чергуються
+    // ------------------------------------------------------------------
+    var FIXED_HEAD = [
+        { id: 'released', title: '🔥 Вже вийшло в якості (з закладок)', gate: false, build: function (n, c, f) { buildRow0(c, f); } },
+        { id: 'personal_movie', title: '🎯 Персональний підбір: Фільми', build: function (n, c, f) { buildPersonalRow(n, 'movie', c, f); } },
+        { id: 'personal_tv', title: '📺 Персональний підбір: Серіали', build: function (n, c, f) { buildPersonalRow(n, 'tv', c, f); } },
+        { id: 'because', title: '🎬 Тому що ви дивилися…', build: function (n, c, f) { buildBecauseRow(n, c, f, 'recent'); } }
+    ];
+
+    var FIXED_TAIL = [
+        { id: 'upcoming', title: '🗓 Очікувані прем\'єри', gate: false, build: function (n, c, f) { buildUpcomingRow(c, f); } }
+    ];
+
+    function seedsCount(v) { var k = 0; each(v.seeds, function (id, e) { if (e.s > 0) k++; }); return k; }
+
+    var DYNAMIC = [
+        { id: 'because_top', title: '🎬 Схоже на ваше улюблене', w: 1.3, ok: function (c) { return seedsCount(c.vec) >= 3; }, build: function (n, c, f) { buildBecauseRow(n, c, f, 'top'); } },
+        { id: 'fav_genre', title: '❤️ Улюблені жанри', w: 1.3, ok: function (c) { return c.vec.topGenres.length > 0; }, build: buildFavGenre },
+        { id: 'top_rated', title: '🏆 Топ рейтингу', w: 1.2, build: buildTopRated },
+        { id: 'gems', title: '💎 Сховані перлини', w: 1.0, build: buildGems },
+        { id: 'micro_movie', title: '🧩 Мікро-жанри: Фільми', w: 1.0, ok: function (c) { return c.vec.topGenres.length > 0; }, build: function (n, c, f) { buildMicroRow(n, 'movie', c, f); } },
+        { id: 'micro_tv', title: '🧩 Мікро-жанри: Серіали', w: 1.0, ok: function (c) { return c.vec.topGenres.length > 0; }, build: function (n, c, f) { buildMicroRow(n, 'tv', c, f); } },
+        { id: 'trending', title: '📈 Тренди під ваш смак', w: 1.0, build: buildTrending },
+        { id: 'franchise', title: '🎞 Продовження франшиз', w: 1.1, ok: function (c) { return topNamed(c.vec.colls, 1, 1).length > 0; }, build: buildFranchise },
+        { id: 'people', title: '🎭 Улюблені актори й режисери', w: 0.9, ok: function (c) { return topNamed(c.vec.people, 1, 2).length > 0; }, build: buildPeople },
+        { id: 'language', title: '🌏 Мова оригіналу', w: 0.8, ok: function (c) { return topLangs(c.vec).length > 0; }, build: buildLanguage },
+        { id: 'decade', title: '📼 Улюблене десятиліття', w: 0.8, ok: function (c) { return topDecades(c.vec).length > 0; }, build: buildDecade },
+        { id: 'fresh', title: '⚡ Свіжі цифрові релізи', w: 0.9, build: buildFreshRow },
+        { id: 'new_series', title: '🆕 Нові серіали', w: 0.8, build: buildNewSeries },
+        { id: 'short', title: '⏱ На один вечір', w: 0.6, build: buildShort },
+        { id: 'explore', title: '🎲 Нові горизонти', w: 0.8, build: buildExploreRow }
+    ];
+
+    function settingOn(id) {
+        var v = true;
+        try { v = Lampa.Storage.get('smart_engine_cat_' + id, true); } catch (e) { }
+        return v !== false && v !== 'false';
+    }
+
+    function dynamicCount() {
+        var v = 6;
+        try { v = parseInt(Lampa.Storage.get('smart_engine_dynamic', 6), 10); } catch (e) { }
+        return v > 0 ? Math.min(v, 15) : 6;
+    }
+
+    function isTopMode() {
+        var p = 'top';
+        try { p = Lampa.Storage.get('smart_engine_position', 'top'); } catch (e) { }
+        return p !== 'native';
+    }
+
+    // Давно не показаний тип ряду має більше шансів з'явитися
+    function staleness(t) {
+        if (!t) return 1.6;
+        var h = (now() - t) / 3600000;
+        return h < 1 ? 0.3 : h < 20 ? 0.6 : h < 72 ? 1.1 : 1.5;
+    }
+
+    function planRows(ctx) {
+        var plan = [], i;
+        if (!state.rowsShown) state.rowsShown = {};
+        for (i = 0; i < FIXED_HEAD.length; i++) if (settingOn(FIXED_HEAD[i].id)) plan.push(FIXED_HEAD[i]);
+        var avail = DYNAMIC.filter(function (r) {
+            if (!settingOn(r.id)) return false;
+            try { return !r.ok || r.ok(ctx); } catch (e) { return false; }
+        });
+        var count = dynamicCount(), tnow = now(), picked = [];
+        while (picked.length < count && avail.length) {
+            var r = weightedPick(avail, function (x) { return x.w * staleness(state.rowsShown[x.id]); });
+            picked.push(r);
+            avail.splice(avail.indexOf(r), 1);
+        }
+        for (i = 0; i < picked.length; i++) state.rowsShown[picked[i].id] = tnow;
+        saveState();
+        plan = plan.concat(picked);
+        for (i = 0; i < FIXED_TAIL.length; i++) if (settingOn(FIXED_TAIL[i].id)) plan.push(FIXED_TAIL[i]);
+        return plan;
+    }
+
+    function makePart(row, pos, ctx) {
+        var part = function (call) {
+            var finish = once(function (json) {
+                try {
+                    if (json && json.results && json.results.length) {
+                        json.smart_engine_row = true;
+                        json.smart_pos = pos;
+                        call(json);
+                    } else call();
+                } catch (e) { log('row call error', e); }
+            });
+            var gated = row.gate !== false;
+            if (gated) gateStart(ctx, pos);
+            var timer = setTimeout(function () {
+                if (gated) gateClaim(ctx, pos, [], function () { });
+                finish();
+            }, ROW_TIMEOUT);
+            try {
+                row.build(pos, ctx, function (json) { clearTimeout(timer); finish(json); });
+            } catch (e) {
+                log('row build error', row.id, e);
+                clearTimeout(timer);
+                if (gated) gateClaim(ctx, pos, [], function () { });
+                finish();
+            }
+        };
+        part.__smart_row = true;
+        return part;
+    }
+
+    var SMART_ROW = {
+        index: 0,
+        name: 'smart_engine',
+        title: '🧠 Розумні рекомендації',
+        screen: ['main'],
+        call: function (params, screen) {
+            var ctx;
+            try { ctx = freshBuildContext(); } catch (e) { log('context error', e); return; }
+            var plan = planRows(ctx);
+            var parts = [];
+            for (var i = 0; i < plan.length; i++) parts.push(makePart(plan[i], i, ctx));
+            return parts;
+        }
+    };
 
     function registerRows() {
         if (!Lampa.ContentRows || !Lampa.ContentRows.add) {
             log('ContentRows API недоступне — оновіть Lampa');
             return false;
         }
-        for (var i = 0; i < ROWS.length; i++) {
-            var row = ROWS[i];
-            Lampa.ContentRows.add({
-                index: row.index,
-                name: row.name,
-                title: row.title,
-                screen: ['main'],
-                call: makeRowCallback(row)
-            });
-        }
+        Lampa.ContentRows.add(SMART_ROW);
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Рекомендації над усіма рядами (у т.ч. рядами інших плагінів)
+    // ------------------------------------------------------------------
+    function liftParts(calls) {
+        var ours = [];
+        for (var i = calls.length - 1; i >= 0; i--) {
+            if (calls[i] && calls[i].__smart_row) { ours.unshift(calls[i]); calls.splice(i, 1); }
+        }
+        for (var j = ours.length - 1; j >= 0; j--) calls.unshift(ours[j]);
+    }
+
+    function hookContentRows() {
+        var CR = Lampa.ContentRows;
+        if (!CR || typeof CR.call !== 'function' || CR.call.__smart) return;
+        var orig = CR.call;
+        var wrapped = function (screen, params, calls) {
+            var r = orig.apply(this, arguments);
+            try { if (screen === 'main' && calls && calls.splice && isTopMode()) liftParts(calls); } catch (e) { log('lift error', e); }
+            return r;
+        };
+        wrapped.__smart = true;
+        CR.call = wrapped;
+    }
+
+    // Резерв: якщо інший плагін додає ряди не через ContentRows — ставимо наші першими в кожній порції
+    function reorderBatch(data) {
+        if (!isTopMode() || !data || !data.length || !data.slice) return data;
+        var ours = [], others = [];
+        for (var i = 0; i < data.length; i++) (data[i] && data[i].smart_engine_row ? ours : others).push(data[i]);
+        if (!ours.length || !others.length) return data;
+        ours.sort(function (a, b) { return (a.smart_pos || 0) - (b.smart_pos || 0); });
+        return ours.concat(others);
+    }
+
+    function wrapLoaded(cb) {
+        if (typeof cb !== 'function') return cb;
+        return function (data) { return cb.call(this, reorderBatch(data)); };
+    }
+
+    function hookApiMain() {
+        var A = Lampa.Api;
+        if (!A || typeof A.main !== 'function' || A.main.__smart) return;
+        var orig = A.main;
+        var wrapped = function (params, oncomplite, onerror) {
+            var next = orig.call(this, params, wrapLoaded(oncomplite), onerror);
+            if (typeof next === 'function') {
+                return function (loaded, empty) { return next.call(this, wrapLoaded(loaded), empty); };
+            }
+            return next;
+        };
+        wrapped.__smart = true;
+        A.main = wrapped;
+    }
+
+    function ensureHooks() {
+        try { hookContentRows(); } catch (e) { log('hook rows error', e); }
+        try { hookApiMain(); } catch (e) { log('hook main error', e); }
+    }
+
+    // ------------------------------------------------------------------
+    // Налаштування плагіна
+    // ------------------------------------------------------------------
+    function registerSettings() {
+        var S = Lampa.SettingsApi;
+        if (!S || !S.addComponent || !S.addParam) return;
+        var comp = 'smart_engine';
+        S.addComponent({ component: comp, name: 'Розумні рекомендації', icon: MENU_ICON });
+        var onChange = function () { invalidate(); };
+        S.addParam({
+            component: comp,
+            param: { name: 'smart_engine_position', type: 'select', values: { top: 'Над усіма рядами', native: 'Звичайне місце' }, default: 'top' },
+            field: { name: 'Позиція рекомендацій', description: 'Ставити розумні ряди вище рядів Lampa та інших плагінів' },
+            onChange: onChange
+        });
+        S.addParam({
+            component: comp,
+            param: { name: 'smart_engine_dynamic', type: 'select', values: { '3': '3', '4': '4', '6': '6', '8': '8', '10': '10', '15': 'Усі' }, default: '6' },
+            field: { name: 'Скільки рядів, що чергуються', description: 'Щоразу добираються інші категорії з увімкнених нижче' },
+            onChange: onChange
+        });
+        var addGroup = function (title, rows) {
+            S.addParam({ component: comp, param: { name: 'smart_engine_title_' + rows[0].id, type: 'title' }, field: { name: title } });
+            for (var i = 0; i < rows.length; i++) {
+                S.addParam({
+                    component: comp,
+                    param: { name: 'smart_engine_cat_' + rows[i].id, type: 'trigger', default: true },
+                    field: { name: rows[i].title },
+                    onChange: onChange
+                });
+            }
+        };
+        addGroup('Постійні ряди', FIXED_HEAD.concat(FIXED_TAIL));
+        addGroup('Ряди, що чергуються', DYNAMIC);
     }
 
     // ------------------------------------------------------------------
@@ -1729,7 +2276,8 @@
                 type: type,
                 title: titleOf(card),
                 g: g,
-                d: decadeOf(card)
+                d: decadeOf(card),
+                l: card.original_language || ''
             };
             p.manual[key].w = clamp(p.manual[key].w, -12, 18);
             prune(p.manual, 500, function (m) { return m.t || 0; });
@@ -1883,8 +2431,9 @@
 
                 // Безкоштовні мікро-теги, якщо повна картка їх уже містить
                 var movie = e.data && e.data.movie;
-                if (movie && movie.keywords && needsMeta(key)) {
-                    meta[key] = parseMeta(movie, type);
+                var persons = e.data && e.data.persons;
+                if (movie && movie.keywords && persons && needsMeta(key)) {
+                    meta[key] = parseMeta(movie, type, persons);
                     saveMeta();
                 } else if (needsMeta(key)) {
                     priorityQueue.push({ type: type, id: card.id, key: key });
@@ -1980,6 +2529,12 @@
         each(v.decades, function (id, s) { if (s > 0) d.push({ id: id, s: s }); });
         d.sort(function (a, b) { return b.s - a.s; });
         lines.push({ title: 'Десятиліття', subtitle: d.length ? d.slice(0, 4).map(function (x) { return x.id; }).join(', ') : '—', noenter: true });
+        var ls = topNamed(v.langs, 4, 1).map(function (x) { return LANG_UA[x.id] || x.id; });
+        if (ls.length) lines.push({ title: 'Мови оригіналу', subtitle: ls.join(', '), noenter: true });
+        var ps = topNamed(v.people, 6, 2).map(function (x) { return x.name; });
+        lines.push({ title: 'Актори й режисери', subtitle: ps.length ? ps.join(', ') : 'збираються у фоні…', noenter: true });
+        var tTotal = Math.abs(v.types.movie || 0) + Math.abs(v.types.tv || 0);
+        if (tTotal) lines.push({ title: 'Фільми / серіали', subtitle: Math.round(100 * Math.max(0, v.types.movie) / tTotal) + '% / ' + Math.round(100 * Math.max(0, v.types.tv) / tTotal) + '%', noenter: true });
         return lines;
     }
 
@@ -2106,6 +2661,7 @@
         injectHead();
         injectMenu();
         listenSignals();
+        ensureHooks();
     }
 
     function init() {
@@ -2113,7 +2669,17 @@
         loadStore();
         registerSource();
         var rowsOk = registerRows();
+        ensureHooks();
+        try { registerSettings(); } catch (e) { log('settings error', e); }
         hookCardMenu();
+
+        // Інші плагіни можуть обгорнути ті самі функції пізніше — перед кожною побудовою головної
+        // переконуємось, що наша обгортка зовнішня
+        try {
+            Lampa.Listener.follow('activity', function (e) {
+                if (e && e.type === 'init' && e.component === 'main') ensureHooks();
+            });
+        } catch (e) { }
 
         if (window.appready) {
             startUI();
@@ -2138,7 +2704,8 @@
             scoreCandidate: scoreCandidate, recordImpressions: recordImpressions, getContext: getContext,
             impressions: function () { return impressions; }, profiles: function () { return profiles; },
             meta: function () { return meta; }, state: function () { return state; },
-            invalidate: invalidate, menuItems: menuItems, SmartSource: SmartSource, ROWS: ROWS
+            invalidate: invalidate, menuItems: menuItems, SmartSource: SmartSource,
+            SMART_ROW: SMART_ROW, DYNAMIC: DYNAMIC, planRows: planRows, reorderBatch: reorderBatch
         }
     };
 
