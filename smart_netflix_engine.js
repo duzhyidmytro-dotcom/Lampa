@@ -18,7 +18,7 @@
     if (window.smart_netflix_engine_loaded) return;
     window.smart_netflix_engine_loaded = true;
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.3.0';
     var DAY = 24 * 60 * 60 * 1000;
     var SESSION = now();
 
@@ -682,16 +682,6 @@
         return out.slice(0, limit);
     }
 
-    // Найсильніші тайтли типу; легкий шум між показами, щоб ряди не повторювались
-    function topSeeds(v, type, count, pool) {
-        var arr = [];
-        each(v.seeds, function (k, e) { if (e.type === type && e.s > 0 && e.id) arr.push(e); });
-        arr.sort(function (a, b) { return b.s - a.s; });
-        var top = arr.slice(0, pool);
-        for (var i = 0; i < top.length; i++) top[i]._j = top[i].s * (0.75 + Math.random() * 0.5);
-        top.sort(function (a, b) { return b._j - a._j; });
-        return top.slice(0, count);
-    }
 
     // Зберігаємо «знімок» матриць смаку в профіль (прозорість + швидкий перегляд)
     function snapshot(pid, v) {
@@ -1218,15 +1208,19 @@
     }
 
     // «Чому це тут?» — пам'ятаємо, з якого ряду і на основі чого з'явилась картка
-    var reasons = {}, reasonsCount = 0;
+    var reasons = {}, reasonsOrder = [];
 
     function noteReasons(items, title) {
-        if (reasonsCount > 1500) { reasons = {}; reasonsCount = 0; }
         for (var i = 0; i < items.length; i++) {
             var it = items[i];
             if (!it._key) continue;
-            if (!reasons[it._key]) reasonsCount++;
+            if (!reasons[it._key]) reasonsOrder.push(it._key);
             reasons[it._key] = { row: title, seeds: it._seeds || [] };
+        }
+        // Забуваємо лише найстаріші — пояснення для карток на екрані лишаються
+        if (reasonsOrder.length > 2000) {
+            var drop = reasonsOrder.splice(0, reasonsOrder.length - 1500);
+            for (var j = 0; j < drop.length; j++) delete reasons[drop[j]];
         }
     }
 
@@ -1326,64 +1320,185 @@
     }
 
     // ------------------------------------------------------------------
-    // Ряди 1–2: персональний підбір (колаборативний перетин)
+    // Персональні ряди за настроєм: один провідний жанр,
+    // без «третьої комедії» серед бойовиків
     // ------------------------------------------------------------------
+    // Жанри-«домішки»: майже не змінюють настрій (драма в бойовику, пригоди у фантастиці)
+    var SOFT_GENRES = { 18: 1, 12: 1 };
+
+    var MOOD_MOVIE = {
+        28: 'Бойовики', 12: 'Пригодницькі фільми', 16: 'Мультфільми', 35: 'Комедії', 80: 'Кримінальні фільми',
+        99: 'Документальні фільми', 18: 'Драми', 10751: 'Сімейні фільми', 14: 'Фентезі', 36: 'Історичні фільми',
+        27: 'Фільми жахів', 10402: 'Музичні фільми', 9648: 'Детективи', 10749: 'Мелодрами', 878: 'Фантастика',
+        53: 'Трилери', 10752: 'Воєнні фільми', 37: 'Вестерни', 10770: 'Телефільми'
+    };
+    var MOOD_TV = {
+        28: 'Екшн-серіали', 12: 'Пригодницькі серіали', 16: 'Анімаційні серіали', 35: 'Комедійні серіали',
+        80: 'Кримінальні серіали', 99: 'Документальні серіали', 18: 'Драматичні серіали', 10751: 'Сімейні серіали',
+        14: 'Фентезі-серіали', 36: 'Історичні серіали', 27: 'Серіали жахів', 9648: 'Детективні серіали',
+        10749: 'Романтичні серіали', 878: 'Фантастичні серіали', 53: 'Серіали-трилери', 10752: 'Воєнні серіали',
+        37: 'Вестерн-серіали', 10764: 'Реаліті-шоу', 10766: 'Мильні опери', 10762: 'Дитячі серіали'
+    };
+
+    function moodName(canon, type) {
+        return (type === 'tv' ? MOOD_TV : MOOD_MOVIE)[canon] || genreName(canon) || '';
+    }
+
+    function seedGenres(seed) {
+        var m = meta[seed.key];
+        return canonGenres((m && m.g && m.g.length) ? m.g : (seed.genres || []));
+    }
+
+    // Наскільки картка вписується в настрій кластера.
+    // null — не вписується (немає провідного жанру або жодного спільного жанру).
+    function moodFit(c, cluster, anchor) {
+        var gs = canonGenres(c.genre_ids || genreIdsOf(c));
+        if (anchor && gs.indexOf(anchor) < 0) return null;
+        var fit = 0, any = false;
+        for (var i = 0; i < gs.length; i++) {
+            var w = cluster[gs[i]] || 0;
+            if (w >= 0.34) { fit += 2 * w; any = true; }
+            else fit -= SOFT_GENRES[gs[i]] ? 1 : 3;
+        }
+        return any ? fit : null;
+    }
+
+    // Обираємо провідний жанр серед ваших тайтлів і беремо як основу лише тайтли з ним
+    function typeSeeds(v, type) {
+        var seeds = [];
+        each(v.seeds, function (k, e) { if (e.type === type && e.s > 0 && e.id) seeds.push(e); });
+        seeds.sort(function (a, b) { return b.s - a.s; });
+        return seeds.slice(0, 30);
+    }
+
+    // Провідні жанри серед ваших тайтлів цього типу (найсильніші — першими)
+    function moodAnchors(v, type, used) {
+        var seeds = typeSeeds(v, type);
+        var gw = {};
+        for (var i = 0; i < seeds.length; i++) {
+            var gs = seedGenres(seeds[i]);
+            for (var j = 0; j < gs.length; j++) {
+                var g = gs[j];
+                if (v.veto[g] || (used && used[g]) || !genresForType([g], type).length) continue;
+                gw[g] = (gw[g] || 0) + seeds[i].s * (j === 0 ? 1 : 0.5) * (SOFT_GENRES[g] ? 0.6 : 1);
+            }
+        }
+        var cands = [];
+        each(gw, function (g, w) { cands.push({ g: parseInt(g, 10), w: w }); });
+        cands.sort(function (a, b) { return b.w - a.w; });
+        return cands;
+    }
+
+    function pickCluster(ctx, type, forceAnchor) {
+        var v = ctx.vec;
+        if (!ctx.usedAnchors) ctx.usedAnchors = {};
+        var used = ctx.usedAnchors[type] || (ctx.usedAnchors[type] = {});
+        var seeds = typeSeeds(v, type);
+        var cands = forceAnchor ? [{ g: forceAnchor, w: 1 }] : moodAnchors(v, type, used);
+        var i, j;
+
+        if (!cands.length) {
+            // Холодний старт: жанр із профілю, без тайтлів-основ
+            var g0 = pickGenre(v, type, 4, null);
+            if (!g0 || used[g0.canon]) return null;
+            used[g0.canon] = 1;
+            var only = {};
+            only[g0.canon] = 1;
+            return { anchor: g0.canon, seeds: [], genres: only };
+        }
+
+        var pick = weightedPick(cands.slice(0, 4), function (x) { return Math.pow(x.w, 1.5); });
+        var anchor = pick.g;
+        used[anchor] = 1;
+
+        var cluster = seeds.filter(function (sd) { return seedGenres(sd).indexOf(anchor) >= 0; });
+        var prof = {}, max = 0;
+        for (i = 0; i < cluster.length; i++) {
+            var cg = seedGenres(cluster[i]);
+            for (j = 0; j < cg.length; j++) prof[cg[j]] = (prof[cg[j]] || 0) + cluster[i].s;
+        }
+        each(prof, function (g, w) { if (w > max) max = w; });
+        each(prof, function (g, w) { prof[g] = max ? w / max : 0; });
+        prof[anchor] = 1;
+
+        var top = cluster.slice(0, 8);
+        for (i = 0; i < top.length; i++) top[i]._j = top[i].s * (0.75 + Math.random() * 0.5);
+        top.sort(function (a, b) { return b._j - a._j; });
+        return { anchor: anchor, seeds: top.slice(0, 4), genres: prof };
+    }
+
     var personalCache = {};
 
     function personalCandidates(type, ctx, opts, done) {
         var v = ctx.vec;
-        var seeds = topSeeds(v, type, opts.seeds || 5, opts.pool || 10);
+        var cl = opts.cluster || pickCluster(ctx, type);
+        if (!cl) return done([], [], null);
+        var seeds = cl.seeds;
+        var anchorId = genresForType([cl.anchor], type)[0];
         var pool = new Pool(type, ctx, 'rec');
         var tasks = [];
 
-        if (seeds.length) {
-            for (var i = 0; i < seeds.length; i++) {
-                (function (seed) {
-                    var pages = opts.pages || (Math.random() < 0.35 ? [1, 2] : [1]);
-                    for (var p = 0; p < pages.length; p++) {
-                        (function (page) {
-                            tasks.push(function (cb) {
-                                tmdbPage(type + '/' + seed.id + '/recommendations', {}, page, function (res) {
-                                    pool.add(res, { seed: seed.key });
-                                    cb();
-                                }, 60 * 24);
-                            });
-                        })(pages[p]);
-                    }
-                })(seeds[i]);
-            }
+        for (var i = 0; i < seeds.length; i++) {
+            (function (seed) {
+                var pages = opts.pages || (Math.random() < 0.35 ? [1, 2] : [1]);
+                for (var p = 0; p < pages.length; p++) {
+                    (function (page) {
+                        tasks.push(function (cb) {
+                            tmdbPage(type + '/' + seed.id + '/recommendations', {}, page, function (res) {
+                                pool.add(res, { seed: seed.key });
+                                cb();
+                            }, 60 * 24);
+                        });
+                    })(pages[p]);
+                }
+            })(seeds[i]);
         }
 
-        // Ключові слова профілю → кандидати з keyword-збігом
-        var kws = topKeywords(v, 6, 2);
-        if (kws.length >= 2) {
-            var pickedKw = shuffle(kws.slice(0)).slice(0, 3);
-            var ids = [];
-            for (var k = 0; k < pickedKw.length; k++) ids.push(pickedKw[k].id);
+        // Теги саме з тайтлів цього кластера + провідний жанр
+        var kwScore = {};
+        for (i = 0; i < seeds.length; i++) {
+            var m = meta[seeds[i].key];
+            if (!m || !m.k) continue;
+            for (var k = 0; k < m.k.length; k++) {
+                var e = v.keywords[m.k[k][0]];
+                if (e && e.score > 0 && !v.kwVeto[m.k[k][0]]) kwScore[m.k[k][0]] = e.score;
+            }
+        }
+        var kwIds = [];
+        each(kwScore, function (id) { kwIds.push(id); });
+        kwIds.sort(function (a, b) { return kwScore[b] - kwScore[a]; });
+        kwIds = kwIds.slice(0, 3);
+        if (kwIds.length && anchorId) {
             tasks.push(function (cb) {
-                var q = { with_keywords: ids.join('|'), without_genres: withoutGenres(v, type), sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 60 : 100 };
+                var q = { with_genres: anchorId, with_keywords: kwIds.join('|'), without_genres: withoutGenres(v, type, [anchorId]), sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 50 : 100 };
                 if (type === 'movie') digitalQuery(q, false);
                 tmdbPage('discover/' + type, q, rand(1, 2), function (res) { pool.add(res, { kw: 1 }); cb(); }, 60 * 6);
             });
         }
 
-        // Серіали: discover/tv за улюбленими жанрами; також холодний старт
-        var topG = genresForType(v.topGenres || [], type).slice(0, 3);
-        if (type === 'tv' || !seeds.length) {
+        // Добірка якісного в провідному жанрі (і холодний старт)
+        if (anchorId) {
             tasks.push(function (cb) {
                 var q = {
+                    with_genres: anchorId,
+                    without_genres: withoutGenres(v, type, [anchorId]),
                     sort_by: 'popularity.desc',
                     'vote_count.gte': type === 'tv' ? 150 : 800,
-                    'vote_average.gte': 6.8,
-                    without_genres: withoutGenres(v, type),
-                    with_genres: topG.length ? topG.join('|') : ''
+                    'vote_average.gte': 6.8
                 };
                 if (type === 'movie') digitalQuery(q, false);
                 tmdbPage('discover/' + type, q, rand(1, 3), function (res) { pool.add(res, {}); cb(); }, 60 * 6);
             });
         }
 
-        join(tasks, function () { done(pool.scored(), seeds); });
+        join(tasks, function () {
+            var list = pool.scored(function (e) {
+                var fit = moodFit(e.c, cl.genres, cl.anchor);
+                if (fit === null) return -1e6;
+                return scoreCandidate(e.c, type, v, e) + fit * 2;
+            }).filter(function (e) { return e.s > -1e5; });
+            done(list, seeds, cl);
+        });
     }
 
     function quoteList(titles) {
@@ -1404,12 +1519,12 @@
     }
 
     function buildPersonalRow(n, type, ctx, finish) {
-        personalCandidates(type, ctx, {}, function (list, seeds) {
+        personalCandidates(type, ctx, {}, function (list, seeds, cl) {
             gateClaim(ctx, n, list, function (picks, rest) {
-                if (!picks.length) return finish();
+                if (picks.length < 4 || !cl) return finish();
                 var basis = seedTitles(picks, seeds || [], 3);
-                var head = type === 'tv' ? '📺 Серіали для вас' : '🎯 Фільми для вас';
-                var title = basis.length ? head + ': схоже на ' + quoteList(basis) : head + ': за вашими жанрами';
+                var head = (type === 'tv' ? '📺 ' : '🎯 ') + moodName(cl.anchor, type) + ' для вас';
+                var title = basis.length ? head + ': схоже на ' + quoteList(basis) : head;
                 finish(scoredRowJson(n, title + profileSuffix(ctx), picks, rest));
             });
         });
@@ -1497,7 +1612,16 @@
 
             join(tasks, function () {
                 var seedKey = seed.key;
-                var list = pool.scored().filter(function (e) { return e.key !== seedKey; });
+                // Настрій тайтлу-основи: без карток, що не мають з ним жодного спільного жанру
+                var mood = {};
+                for (var gi = 0; gi < g.length; gi++) mood[g[gi]] = 1;
+                var all = pool.scored().filter(function (e) { return e.key !== seedKey; });
+                var list = g.length ? pool.scored(function (e) {
+                    var fit = moodFit(e.c, mood, null);
+                    if (fit === null) return -1e6;
+                    return scoreCandidate(e.c, type, v, e) + fit * 1.5;
+                }).filter(function (e) { return e.key !== seedKey && e.s > -1e5; }) : all;
+                if (list.length < 6) list = all;
                 gateClaim(ctx, n, list, function (picks, rest) {
                     if (!picks.length) return finish();
                     finish(scoredRowJson(n, rowTitle(seed.title), picks, rest));
@@ -1591,31 +1715,15 @@
     // ------------------------------------------------------------------
     function buildFreshRow(n, ctx, finish) {
         var v = ctx.vec;
-        var topG = genresForType(v.topGenres || [], 'movie').slice(0, 3);
-        var q = {
-            'release_date.gte': today(-180),
-            with_genres: topG.join('|'),
-            without_genres: withoutGenres(v, 'movie', topG),
-            sort_by: 'popularity.desc',
-            'vote_count.gte': 20
-        };
-        digitalQuery(q, true);
-        var pool = new Pool('movie', ctx, 'digital');
-        var total = 1;
-        join([
-            function (cb) { var qq = {}; each(q, function (k, x) { qq[k] = x; }); qq.page = 1; tmdbList('discover/movie', qq, function (res, json) { total = json.total_pages || 1; pool.add(res, {}); cb(); }, 60 * 3); },
-            function (cb) { var qq = {}; each(q, function (k, x) { qq[k] = x; }); qq.page = 2; tmdbList('discover/movie', qq, function (res) { pool.add(res, {}); cb(); }, 60 * 3); }
-        ], function () {
-            var list = pool.scored(function (e) {
+        var base = { 'release_date.gte': today(-180), sort_by: 'popularity.desc', 'vote_count.gte': 20 };
+        digitalQuery(base, true);
+        moodRow(n, ctx, finish, {
+            type: 'movie', base: base, tag: 'fresh', pages: [1, 2], cache: 60 * 3,
+            score: function (e) {
                 var gm = genreMatch(e.c, v);
-                return bayes(e.c) * 2 + gm.score * 0.7 - impressionPenalty(e.key) - (gm.veto ? 25 : 0) + Math.random();
-            });
-            gateClaim(ctx, n, list, function (picks) {
-                if (!picks.length) return finish();
-                var items = toItems(picks);
-                recordImpressions(items);
-                finish(discoverRowJson('⚡ Свіжі цифрові релізи (Під ваш профіль)', 'discover/movie', q, items, total));
-            });
+                return bayes(e.c) * 2 + gm.score * 0.7 - impressionPenalty(e.key) + Math.random();
+            },
+            titleFor: function (g) { return g ? '⚡ Нове в цифрі: ' + lowerFirst(moodName(g.canon, 'movie')) : '⚡ Свіжі цифрові релізи (під ваш профіль)'; }
         });
     }
 
@@ -1880,17 +1988,12 @@
         var y = parseInt(dec.d, 10);
         var from = y + '-01-01', to = (y + 9) + '-12-31';
         if (type === 'movie' && to > today(-45)) to = today(-45);
-        var q = {
-            with_genres: topGenresParam(v, type, 3),
-            without_genres: withoutGenres(v, type),
-            sort_by: 'vote_count.desc',
-            'vote_count.gte': type === 'tv' ? 80 : 200
-        };
-        q[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = from;
-        q[type === 'tv' ? 'first_air_date.lte' : 'primary_release_date.lte'] = to;
-        runListRow(n, ctx, finish, {
-            type: type, path: 'discover/' + type, query: q, pages: [rand(1, 3)], cache: 60 * 24,
-            title: '📼 Хіти ' + y + '-х під ваш смак' + typeSuffix(type)
+        var base = { sort_by: 'vote_count.desc', 'vote_count.gte': type === 'tv' ? 80 : 200 };
+        base[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = from;
+        base[type === 'tv' ? 'first_air_date.lte' : 'primary_release_date.lte'] = to;
+        moodRow(n, ctx, finish, {
+            type: type, base: base, tag: 'decade', pages: [rand(1, 3)], cache: 60 * 24,
+            titleFor: function (g) { return g ? '📼 ' + moodName(g.canon, type) + ' ' + y + '-х' : '📼 Хіти ' + y + '-х під ваш смак' + typeSuffix(type); }
         });
     }
 
@@ -1904,19 +2007,15 @@
         var langs = topLangs(v);
         if (!langs.length) return gateClaim(ctx, n, [], function () { finish(); });
         var l = weightedPick(langs, function (x) { return x.score; }).id;
-        var base = {
-            with_original_language: l,
-            without_genres: withoutGenres(v, type),
-            sort_by: 'popularity.desc',
-            'vote_count.gte': type === 'tv' ? 20 : 40
-        };
+        var lname = LANG_UA[l] || l;
+        var base = { with_original_language: l, sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 20 : 40 };
         if (type === 'movie') digitalQuery(base, false);
-        var withG = copyObj(base);
-        withG.with_genres = topGenresParam(v, type, 3);
-        var title = '🌏 Мова оригіналу: ' + (LANG_UA[l] || l) + typeSuffix(type);
-        runListRow(n, ctx, finish, {
-            type: type, path: 'discover/' + type, query: withG, pages: [rand(1, 2)], title: title,
-            fallback: function () { return { type: type, path: 'discover/' + type, query: base, pages: [rand(1, 2)], title: title }; }
+        var plain = copyObj(base);
+        plain.without_genres = withoutGenres(v, type);
+        moodRow(n, ctx, finish, {
+            type: type, base: base, tag: 'lang', pages: [rand(1, 2)],
+            titleFor: function (g) { return g ? '🌏 ' + moodName(g.canon, type) + ' (' + lname + ' мова)' : '🌏 Мова оригіналу: ' + lname + typeSuffix(type); },
+            last: { type: type, path: 'discover/' + type, query: plain, pages: [rand(1, 2)], title: '🌏 Мова оригіналу: ' + lname + typeSuffix(type) }
         });
     }
 
@@ -1995,37 +2094,51 @@
 
     // ⏱ Фільми до 100 хвилин в улюблених жанрах
     function buildShort(n, ctx, finish) {
-        var v = ctx.vec;
-        var q = {
-            with_genres: topGenresParam(v, 'movie', 3),
-            without_genres: withoutGenres(v, 'movie'),
-            'with_runtime.gte': 70,
-            'with_runtime.lte': 100,
-            sort_by: 'popularity.desc',
-            'vote_count.gte': 300
-        };
-        digitalQuery(q, false);
-        runListRow(n, ctx, finish, {
-            type: 'movie', path: 'discover/movie', query: q, pages: [rand(1, 4)], mode: 'rec',
-            title: '⏱ На один вечір: до 100 хвилин'
+        var base = { 'with_runtime.gte': 70, 'with_runtime.lte': 100, sort_by: 'popularity.desc', 'vote_count.gte': 300 };
+        digitalQuery(base, false);
+        moodRow(n, ctx, finish, {
+            type: 'movie', base: base, tag: 'short', pages: [rand(1, 4)], mode: 'rec',
+            titleFor: function (g) { return g ? '⏱ ' + moodName(g.canon, 'movie') + ' на один вечір (до 100 хв)' : '⏱ На один вечір: до 100 хвилин'; }
         });
     }
 
     // 🆕 Серіали, що стартували за останні ~7 місяців
     function buildNewSeries(n, ctx, finish) {
         var v = ctx.vec;
-        var q = {
-            'first_air_date.gte': today(-200),
-            'first_air_date.lte': today(),
-            with_genres: topGenresParam(v, 'tv', 3),
-            without_genres: withoutGenres(v, 'tv'),
-            sort_by: 'popularity.desc',
-            'vote_count.gte': 15
+        var base = { 'first_air_date.gte': today(-200), 'first_air_date.lte': today(), sort_by: 'popularity.desc', 'vote_count.gte': 15 };
+        var plain = copyObj(base);
+        plain.without_genres = withoutGenres(v, 'tv');
+        moodRow(n, ctx, finish, {
+            type: 'tv', base: base, tag: 'newtv', pages: [1, 2],
+            titleFor: function (g) { return g ? '🆕 Нові ' + lowerFirst(moodName(g.canon, 'tv')) : '🆕 Нові серіали під ваш смак'; },
+            last: { type: 'tv', path: 'discover/tv', query: plain, pages: [1], title: '🆕 Нові серіали' }
+        });
+    }
+
+    function lowerFirst(t) { return t ? t.charAt(0).toLowerCase() + t.slice(1) : t; }
+
+    // Один жанр на ряд (жанр — у назві). Якщо в жанрі замало тайтлів —
+    // змішаний варіант із ваших топ-жанрів, потім — o.last (без жанрів).
+    function moodRow(n, ctx, finish, o) {
+        var v = ctx.vec;
+        var path = 'discover/' + o.type;
+        var g = pickGenreFor(ctx, o.type, 5, o.tag);
+        var mixed = copyObj(o.base);
+        mixed.with_genres = topGenresParam(v, o.type, 3);
+        mixed.without_genres = withoutGenres(v, o.type);
+        var mixedSpec = {
+            type: o.type, path: path, query: mixed, pages: o.pages, mode: o.mode, cache: o.cache, score: o.score,
+            title: o.titleFor(null),
+            fallback: o.last ? function () { return o.last; } : null
         };
+        if (!g) return runListRow(n, ctx, finish, mixedSpec);
+        var single = copyObj(o.base);
+        single.with_genres = g.id;
+        single.without_genres = withoutGenres(v, o.type, [g.id]);
         runListRow(n, ctx, finish, {
-            type: 'tv', path: 'discover/tv', query: q, pages: [1, 2], minItems: 6,
-            title: '🆕 Нові серіали під ваш смак',
-            fallback: function () { var qq = copyObj(q); delete qq.with_genres; return { type: 'tv', path: 'discover/tv', query: qq, pages: [1], title: '🆕 Нові серіали' }; }
+            type: o.type, path: path, query: single, pages: o.pages, mode: o.mode, cache: o.cache, score: o.score,
+            title: o.titleFor(g), minItems: 6,
+            fallback: function () { return mixedSpec; }
         });
     }
 
@@ -2049,18 +2162,17 @@
         ctx.usedStudios[st.id] = 1;
         var kind = st.id.charAt(0), id = st.id.slice(1);
         var type = kind === 'n' ? 'tv' : 'movie';
-        var base = { sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 40 : 80, without_genres: withoutGenres(v, type) };
+        var mode = type === 'movie' ? 'rec' : 'digital';
+        var base = { sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 40 : 80 };
         base[kind === 'n' ? 'with_networks' : 'with_companies'] = id;
         if (type === 'movie') digitalQuery(base, false);
-        var withG = copyObj(base);
-        withG.with_genres = topGenresParam(v, type, 3);
+        var plain = copyObj(base);
+        plain.without_genres = withoutGenres(v, type);
         var icon = type === 'tv' ? '📡 ' : '🏢 ';
-        runListRow(n, ctx, finish, {
-            type: type, path: 'discover/' + type, query: withG, pages: [rand(1, 3)], mode: type === 'movie' ? 'rec' : 'digital', cache: 60 * 12,
-            title: icon + 'Від ' + st.name + ' під ваш смак',
-            fallback: function () {
-                return { type: type, path: 'discover/' + type, query: base, pages: [rand(1, 3)], mode: type === 'movie' ? 'rec' : 'digital', title: icon + 'Більше від ' + st.name };
-            }
+        moodRow(n, ctx, finish, {
+            type: type, base: base, tag: 'studio', pages: [rand(1, 3)], mode: mode, cache: 60 * 12,
+            titleFor: function (g) { return g ? icon + st.name + ': ' + lowerFirst(moodName(g.canon, type)) : icon + 'Від ' + st.name + ' під ваш смак'; },
+            last: { type: type, path: 'discover/' + type, query: plain, pages: [rand(1, 3)], mode: mode, title: icon + 'Більше від ' + st.name }
         });
     }
 
@@ -2084,30 +2196,23 @@
     // 🎬 Міні-серіали (TMDB type = Miniseries)
     function buildMiniseries(n, ctx, finish) {
         var v = ctx.vec;
-        var base = { with_type: 2, sort_by: 'popularity.desc', 'vote_count.gte': 80, without_genres: withoutGenres(v, 'tv') };
-        var withG = copyObj(base);
-        withG.with_genres = topGenresParam(v, 'tv', 3);
-        runListRow(n, ctx, finish, {
-            type: 'tv', path: 'discover/tv', query: withG, pages: [rand(1, 3)], cache: 60 * 12,
-            title: '🎬 Міні-серіали на кілька вечорів',
-            fallback: function () { return { type: 'tv', path: 'discover/tv', query: base, pages: [rand(1, 3)], title: '🎬 Міні-серіали на кілька вечорів' }; }
+        var base = { with_type: 2, sort_by: 'popularity.desc', 'vote_count.gte': 80 };
+        var plain = copyObj(base);
+        plain.without_genres = withoutGenres(v, 'tv');
+        moodRow(n, ctx, finish, {
+            type: 'tv', base: base, tag: 'mini', pages: [rand(1, 3)], cache: 60 * 12,
+            titleFor: function (g) { return g ? '🎬 Міні-серіали: ' + genreName(g.canon) : '🎬 Міні-серіали на кілька вечорів'; },
+            last: { type: 'tv', path: 'discover/tv', query: plain, pages: [rand(1, 3)], title: '🎬 Міні-серіали на кілька вечорів' }
         });
     }
 
     // 📦 Завершені серіали з високим рейтингом — можна дивитись запоєм
     function buildBinge(n, ctx, finish) {
         var v = ctx.vec;
-        var q = {
-            with_status: 3,
-            with_genres: topGenresParam(v, 'tv', 3),
-            without_genres: withoutGenres(v, 'tv'),
-            'vote_average.gte': 7.4,
-            'vote_count.gte': 250,
-            sort_by: 'vote_count.desc'
-        };
-        runListRow(n, ctx, finish, {
-            type: 'tv', path: 'discover/tv', query: q, pages: [rand(1, 3)], cache: 60 * 24, score: qualityScore('tv', v),
-            title: '📦 Завершені серіали для марафону'
+        var base = { with_status: 3, 'vote_average.gte': 7.4, 'vote_count.gte': 250, sort_by: 'vote_count.desc' };
+        moodRow(n, ctx, finish, {
+            type: 'tv', base: base, tag: 'binge', pages: [rand(1, 3)], cache: 60 * 24, score: qualityScore('tv', v),
+            titleFor: function (g) { return g ? '📦 Для марафону: ' + lowerFirst(moodName(g.canon, 'tv')) + ' (завершені)' : '📦 Завершені серіали для марафону'; }
         });
     }
 
@@ -2116,16 +2221,11 @@
         var v = ctx.vec, type = pickType(v);
         var cur = new Date().getFullYear();
         var year = rand(cur - 10, cur - 1);
-        var q = {
-            with_genres: topGenresParam(v, type, 3),
-            without_genres: withoutGenres(v, type),
-            sort_by: 'vote_average.desc',
-            'vote_count.gte': type === 'tv' ? 120 : 400
-        };
-        q[type === 'tv' ? 'first_air_date_year' : 'primary_release_year'] = year;
-        runListRow(n, ctx, finish, {
-            type: type, path: 'discover/' + type, query: q, pages: [1, 2], cache: 60 * 24, score: qualityScore(type, v),
-            title: '🏅 Найкраще ' + year + ' року під ваш смак' + typeSuffix(type)
+        var base = { sort_by: 'vote_average.desc', 'vote_count.gte': type === 'tv' ? 120 : 400 };
+        base[type === 'tv' ? 'first_air_date_year' : 'primary_release_year'] = year;
+        moodRow(n, ctx, finish, {
+            type: type, base: base, tag: 'year', pages: [1, 2], cache: 60 * 24, score: qualityScore(type, v),
+            titleFor: function (g) { return g ? '🏅 ' + moodName(g.canon, type) + ' ' + year + ' року: найкраще' : '🏅 Найкраще ' + year + ' року під ваш смак' + typeSuffix(type); }
         });
     }
 
@@ -2166,8 +2266,8 @@
 
     // Найточніші ряди: будуються від конкретних тайтлів, акторів, студій
     var PERSONAL = [
-        { id: 'personal_movie', title: '🎯 Фільми для вас', w: 1.4, max: 1, build: function (n, c, f) { buildPersonalRow(n, 'movie', c, f); } },
-        { id: 'personal_tv', title: '📺 Серіали для вас', w: 1.2, max: 1, ok: function (c) { return seedsCount(c.vec, 'tv') > 0 || (c.vec.types.tv || 0) > 0; }, build: function (n, c, f) { buildPersonalRow(n, 'tv', c, f); } },
+        { id: 'personal_movie', title: '🎯 Фільми для вас (за настроєм)', w: 1.4, max: 2, build: function (n, c, f) { buildPersonalRow(n, 'movie', c, f); } },
+        { id: 'personal_tv', title: '📺 Серіали для вас (за настроєм)', w: 1.2, max: 2, ok: function (c) { return seedsCount(c.vec, 'tv') > 0 || (c.vec.types.tv || 0) > 0; }, build: function (n, c, f) { buildPersonalRow(n, 'tv', c, f); } },
         { id: 'because', title: '🎬 Тому що ви дивилися…', w: 1.5, max: 3, ok: function (c) { return seedsCount(c.vec) > 0; }, build: function (n, c, f) { buildBecauseRow(n, c, f, 'recent'); } },
         { id: 'because_top', title: '❤️ Схоже на ваше улюблене', w: 1.1, max: 2, ok: function (c) { return seedsCount(c.vec) >= 3; }, build: function (n, c, f) { buildBecauseRow(n, c, f, 'top'); } },
         { id: 'because_bookmark', title: '🔖 Схоже на ваші закладки', w: 0.9, max: 1, ok: function (c) { return bookmarkSeeds(c).length > 0; }, build: function (n, c, f) { buildBecauseRow(n, c, f, 'bookmark'); } },
@@ -2287,14 +2387,24 @@
         return null;
     }
 
-    function takeBackup(ctx) {
+    // Запасний ряд — переважно з тієї ж групи (персональний на місце персонального)
+    function takeBackup(ctx, prefer) {
         var used = ctx.backupUsed || {};
-        while (ctx.backups && ctx.backups.length) {
-            var r = ctx.backups.shift();
-            if ((used[r.id] || 0) < (r.max || 1)) { used[r.id] = (used[r.id] || 0) + 1; return r; }
+        var list = ctx.backups || [];
+        var pass = prefer === null ? [function () { return true; }] : [function (r) { return isPersonalRow(r) === prefer; }, function () { return true; }];
+        for (var p = 0; p < pass.length; p++) {
+            for (var i = 0; i < list.length; i++) {
+                var r = list[i];
+                if ((used[r.id] || 0) >= (r.max || 1) || !pass[p](r)) continue;
+                list.splice(i, 1);
+                used[r.id] = (used[r.id] || 0) + 1;
+                return r;
+            }
         }
         return null;
     }
+
+    function isPersonalRow(r) { return PERSONAL.indexOf(r) >= 0; }
 
     function makePart(row, pos, ctx) {
         var part = function (call) {
@@ -2319,7 +2429,8 @@
                 var done = once(function (json) {
                     if (json && json.results && json.results.length) { clearTimeout(timer); return finish(json); }
                     // Порожньо → пробуємо запасну категорію на тому ж місці
-                    var backup = attempt < 2 && current.id !== 'released' && current.id !== 'upcoming' ? takeBackup(ctx) : null;
+                    // 1-ша заміна — з тієї ж групи, далі — будь-яка
+                    var backup = attempt < 3 && current.id !== 'released' && current.id !== 'upcoming' ? takeBackup(ctx, attempt === 0 ? isPersonalRow(row) : null) : null;
                     if (!backup) { clearTimeout(timer); return finish(); }
                     attempt++;
                     current = backup;
@@ -2528,10 +2639,16 @@
             }
 
             if (url.indexOf('smart:personal:') === 0) {
-                var type = url.slice(15) === 'tv' ? 'tv' : 'movie';
-                var cacheKey = activeProfile() + type;
+                var pp = url.split(':');
+                var type = pp[2] === 'tv' ? 'tv' : 'movie';
+                var anchor = parseInt(pp[3], 10) || 0;
+                var cacheKey = activeProfile() + type + anchor;
                 if (personalCache[cacheKey]) return ok(personalCache[cacheKey]);
-                personalCandidates(type, getContext(), { seeds: 6, pool: 8, pages: [1, 2] }, function (list) {
+                var base = getContext();
+                var pctx = { mode: base.mode, sig: base.sig, vec: base.vec, ex: base.ex };
+                var cl = pickCluster(pctx, type, anchor || null);
+                if (cl && anchor) { var tops = typeSeeds(base.vec, type).filter(function (sd) { return seedGenres(sd).indexOf(anchor) >= 0; }); cl.seeds = tops.slice(0, 6); }
+                personalCandidates(type, pctx, { cluster: cl, pages: [1, 2] }, function (list) {
                     personalCache[cacheKey] = toItems(list.slice(0, 120));
                     ok(personalCache[cacheKey]);
                 });
@@ -2922,6 +3039,22 @@
         });
     }
 
+    // Вибір настрою: «Бойовики», «Трилери»… — лише з ваших провідних жанрів
+    function moodMenu(type, back) {
+        var v = getContext().vec;
+        var anchors = moodAnchors(v, type, null).slice(0, 8);
+        if (!anchors.length) {
+            anchors = (v.topGenres || []).filter(function (g) { return genresForType([g], type).length; }).slice(0, 6).map(function (g) { return { g: g }; });
+        }
+        if (!anchors.length) { notify('Ще замало даних — подивіться кілька тайтлів'); return back(); }
+        Lampa.Select.show({
+            title: type === 'tv' ? '📺 Серіали для вас — настрій' : '🎯 Фільми для вас — настрій',
+            items: anchors.map(function (a) { var name = moodName(a.g, type); return { title: name, url: 'smart:personal:' + type + ':' + a.g, label: (type === 'tv' ? '📺 ' : '🎯 ') + name + ' для вас' }; }),
+            onBack: back,
+            onSelect: function (a) { openCatalog(a.label, a.url); }
+        });
+    }
+
     function confirmReset(back) {
         var pids = targetProfiles();
         Lampa.Select.show({
@@ -2948,8 +3081,8 @@
         try { v = getContext().vec; } catch (e) { }
 
         var items = [
-            { title: '🎯 Фільми для вас', url: 'smart:personal:movie' },
-            { title: '📺 Серіали для вас', url: 'smart:personal:tv' },
+            { title: '🎯 Фільми для вас — за настроєм', action: 'mood_movie' },
+            { title: '📺 Серіали для вас — за настроєм', action: 'mood_tv' },
             { title: '🗓 Очікувані фільми', url: 'smart:raw:' + buildPath('discover/movie', upcomingQuery(v)) },
             { title: '📡 Очікувані серіали', url: 'smart:raw:' + buildPath('discover/tv', { 'first_air_date.gte': today(1), 'first_air_date.lte': today(180), sort_by: 'popularity.desc', without_genres: withoutGenres(v, 'tv') }) },
             { title: '🎟 Новинки кінопрокату', url: 'smart:raw:' + buildPath('discover/movie', theatricalQuery(v)) },
@@ -2968,6 +3101,7 @@
             onSelect: function (a) {
                 if (a.url) return openCatalog(a.title, a.url);
                 if (a.action === 'micro') return microMenu(back);
+                if (a.action === 'mood_movie' || a.action === 'mood_tv') return moodMenu(a.action === 'mood_tv' ? 'tv' : 'movie', back);
                 if (a.action === 'profile') return openProfileSelect();
                 if (a.action === 'taste') {
                     return Lampa.Select.show({ title: '📊 Мій смак · ' + PROFILE_LABEL[activeProfile()], items: tasteSummary(), onBack: back });
